@@ -3,8 +3,9 @@ import random
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
-
+from tqdm import tqdm
 from SASRec import SASRec, get_experiment_config
+from evaluate import evaluate, SasEvalDataset
 
 
 class SASRecDataset(Dataset):
@@ -45,14 +46,18 @@ class SASRecDataset(Dataset):
         )
 
 
-def train_one_version(model, train_loader, device, epochs=10, lr=0.001):
+def train_one_version(model, train_loader, val_loader, num_items, device, epochs=10, lr=0.001, patience=3):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    best_ndcg = -1
+    epochs_without_improvement = 0
+    best_model_state = None
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
 
-        for seq, pos, neg in train_loader:
+        for seq, pos, neg in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} - Training"):
             seq = seq.to(device)
             pos = pos.to(device)
             neg = neg.to(device)
@@ -66,7 +71,27 @@ def train_one_version(model, train_loader, device, epochs=10, lr=0.001):
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}")
+
+        val_recalls, val_ndcgs = evaluate(
+            model, val_loader, num_items, device, k_list=[10]
+        )
+        ndcg_10 = val_ndcgs[10]
+        print(f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} - Val NDCG@10: {ndcg_10:.4f}")
+
+        if ndcg_10 > best_ndcg:
+            best_ndcg = ndcg_10
+            epochs_without_improvement = 0
+            best_model_state = model.state_dict()
+            print('Validation NDCG improved.')
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= patience:
+            print('Early stopping')
+            break
+
+    return best_model_state
+
 
 
 def get_num_items(train_data):
@@ -82,6 +107,9 @@ def main():
 
     with open("train.json", "r") as f:
         train_data = json.load(f)
+    with open("val.json", "r") as f:
+        val_data = json.load(f)
+
 
     num_items = get_num_items(train_data)
     print("num_items =", num_items)
@@ -109,11 +137,24 @@ def main():
             shuffle=True
         )
 
+        val_dataset = SasEvalDataset(
+            data=val_data,
+            max_seq_len=config.max_seq_len
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False
+        )
+
+
         model = SASRec(config).to(device)
 
         train_one_version(
             model=model,
             train_loader=train_loader,
+            val_loader=val_loader,
+            num_items=num_items,
             device=device,
             epochs=epochs,
             lr=0.001
